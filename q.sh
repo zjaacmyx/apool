@@ -1,194 +1,121 @@
 #!/bin/bash
 
-# Apool XMRMiner 自动部署和升级脚本
-# 适用于Debian/Ubuntu系统
-
 set -e
 
-INSTALL_DIR="/opt/xmrminer"
-WALLET_ADDRESS="CP_efl292npux"
-POOL_URL="xmr.apool.io:3333"
-VERSION="v3.2.3"
-GITHUB_REPO="apool-io/xmrminer"
+echo "========== apoolminer 自动安装并注册为服务 =========="
 
-echo "=== 开始部署Apool XMRMiner挖矿程序 ==="
+# 默认账户和矿池配置
+ACCOUNT="${1:-CP_efl292npux}"
+INSTALL_DIR="/opt/apoolminer"
+SERVICE_FILE="/etc/systemd/system/apoolminer.service"
+POOL="qubic.eu.apool.net:8080" # 注意：脚本中的算法参数是 --algo xmr，但矿池地址qubic.eu.apool.net:8080是Qubic矿池。请确保算法和矿池匹配。
 
-# 更新系统并安装依赖
-echo "[1/5] 更新系统并安装依赖..."
-apt update -y
-apt install -y wget curl jq
-
-# 下载XMRMiner
-echo "[2/5] 下载XMRMiner ${VERSION}..."
+# 目录清理或创建
 if [ -d "$INSTALL_DIR" ]; then
-    echo "检测到已存在的目录，正在删除..."
-    rm -rf "$INSTALL_DIR"
+    echo "清理安装目录 $INSTALL_DIR..."
+    rm -rf "$INSTALL_DIR"/*
+else
+    echo "创建安装目录 $INSTALL_DIR..."
+    mkdir -p "$INSTALL_DIR"
 fi
 
-mkdir -p $INSTALL_DIR
-cd $INSTALL_DIR
+# 安装依赖
+echo "安装必要组件..."
+# 检查当前系统是否为 Debian/Ubuntu 或其他使用 apt 的系统
+if command -v apt &> /dev/null; then
+    apt update
+    apt install -y wget tar jq
+elif command -v yum &> /dev/null; then
+    yum install -y wget tar jq
+else
+    echo "警告：无法识别包管理器 (apt/yum)。请手动确保安装了 wget, tar, jq。"
+fi
 
-# 下载最新版本
-DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/xmrminer-${VERSION}-linux-x64.tar.gz"
-echo "正在从 ${DOWNLOAD_URL} 下载..."
-wget -O xmrminer.tar.gz $DOWNLOAD_URL
-tar -xzf xmrminer.tar.gz
-rm xmrminer.tar.gz
 
-# 赋予执行权限
-chmod +x $INSTALL_DIR/xmrminer
+# 下载
+echo "下载 apoolminer..."
+# 获取最新版本号
+VERSION=$(wget -qO- https://api.github.com/repos/apool-io/apoolminer/releases/latest | jq -r .tag_name)
+[ -z "$VERSION" ] && VERSION="v3.2.0"
+DOWNLOAD_URL="https://github.com/apool-io/apoolminer/releases/download/${VERSION}/apoolminer_linux_qubic_autoupdate_${VERSION}.tar.gz"
 
-# 创建配置文件
-echo "[3/5] 创建配置文件..."
-cat > $INSTALL_DIR/config.json <<EOF
-{
-    "autosave": true,
-    "cpu": {
-        "enabled": true,
-        "huge-pages": true,
-        "hw-aes": null,
-        "priority": null,
-        "max-threads-hint": 100
-    },
-    "opencl": false,
-    "cuda": false,
-    "pools": [
-        {
-            "algo": "rx/0",
-            "coin": "monero",
-            "url": "$POOL_URL",
-            "user": "$WALLET_ADDRESS",
-            "pass": "x",
-            "rig-id": null,
-            "keepalive": true,
-            "enabled": true,
-            "tls": false,
-            "tls-fingerprint": null
-        }
-    ],
-    "log-file": "/var/log/xmrminer.log",
-    "donate-level": 1
-}
+# 下载并解压
+wget -qO- "$DOWNLOAD_URL" | tar -zxf - -C "$INSTALL_DIR" --strip-components=1
+echo "Apoolminer 版本 $VERSION 下载完成。"
+
+# 写入 update.sh (保持不变，用于自动更新)
+echo "写入 update.sh..."
+cat > "$INSTALL_DIR/update.sh" <<EOF
+#!/bin/bash
+LAST_VERSION=\$(wget -qO- https://api.github.com/repos/apool-io/apoolminer/releases/latest | jq -r .tag_name | cut -b 2-)
+LOCAL_VERSION=\$("$INSTALL_DIR"/apoolminer --version | awk '{print \$2}')
+[ "\$LAST_VERSION" == "\$LOCAL_VERSION" ] && echo '无更新' && exit 0
+echo "\$LAST_VERSION" | awk -F . '{print \$1\$2\$3, "LAST_VERSION"}' > /tmp/versions
+echo "\$LOCAL_VERSION" | awk -F . '{print \$1\$2\$3, "LOCAL_VERSION"}' >> /tmp/versions
+NEW_VERSION=\$(sort -n /tmp/versions | tail -1 | awk '{print \$2}')
+[ "\$NEW_VERSION" == "\$LOCAL_VERSION" ] && exit 0
+bash <(wget -qO- https://raw.githubusercontent.com/chuben/script/main/apoolminer.sh) "$ACCOUNT"
 EOF
 
-# 创建systemd服务
-echo "[4/5] 创建systemd服务..."
-cat > /etc/systemd/system/xmrminer.service <<EOF
+chmod +x "$INSTALL_DIR/update.sh"
+
+# 写入 run.sh (已修改，直接使用 IP 作为 worker)
+echo "写入 run.sh (不含IP转换)..."
+cat > "$INSTALL_DIR/run.sh" <<EOF
+#!/bin/bash
+
+# 检查并执行更新
+/bin/bash "$INSTALL_DIR/update.sh"
+
+# 尝试获取公网IP
+# 169.254.169.254 是云服务商的元数据服务地址，如果获取不到，尝试使用通用 IP 服务
+ip=\$(wget -T 3 -t 2 -qO- http://169.254.169.254/2021-03-23/meta-data/public-ipv4)
+
+if [ -z "\$ip" ]; then
+    echo "尝试从通用服务获取公网IP..."
+    ip=\$(wget -T 3 -t 2 -qO- ipinfo.io/ip)
+fi
+
+if [ -z "\$ip" ]; then
+    echo "错误：无法获取公网IP地址。退出。"
+    exit 1
+fi
+
+# 直接使用 IP 作为矿工别名
+minerAlias="\$ip"
+
+echo "启动矿工，Worker名称: \$minerAlias"
+
+
+exec ${INSTALL_DIR}/apoolminer --algo qubic_xmr --account "$ACCOUNT" --worker "\$minerAlias" --pool "$POOL"
+EOF
+
+chmod +x "$INSTALL_DIR/run.sh"
+
+# 写入 systemd 服务 (保持不变)
+echo "写入 systemd 服务文件 $SERVICE_FILE..."
+tee "$SERVICE_FILE" > /dev/null <<EOF
 [Unit]
-Description=Apool XMRMiner Cryptocurrency Miner
+Description=Apool XMR Miner
 After=network.target
 
 [Service]
 Type=simple
 User=root
 WorkingDirectory=$INSTALL_DIR
-ExecStart=$INSTALL_DIR/xmrminer -c $INSTALL_DIR/config.json
+ExecStart=$INSTALL_DIR/run.sh
 Restart=always
-RestartSec=10
-StandardOutput=journal
-StandardError=journal
+RestartSec=30
+Environment="LD_LIBRARY_PATH=$INSTALL_DIR"
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# 创建自动升级脚本
-echo "[5/5] 创建自动升级脚本..."
-cat > /usr/local/bin/xmrminer-upgrade.sh <<'UPGRADE_SCRIPT'
-#!/bin/bash
-
-INSTALL_DIR="/opt/xmrminer"
-GITHUB_REPO="apool-io/xmrminer"
-LOG_FILE="/var/log/xmrminer-upgrade.log"
-CURRENT_VERSION_FILE="$INSTALL_DIR/version.txt"
-
-echo "$(date): 开始检查XMRMiner更新..." >> $LOG_FILE
-
-# 获取当前版本
-if [ -f "$CURRENT_VERSION_FILE" ]; then
-    CURRENT_VERSION=$(cat $CURRENT_VERSION_FILE)
-else
-    CURRENT_VERSION="unknown"
-fi
-
-# 获取最新版本
-LATEST_VERSION=$(curl -s https://api.github.com/repos/$GITHUB_REPO/releases/latest | jq -r '.tag_name')
-
-if [ -z "$LATEST_VERSION" ] || [ "$LATEST_VERSION" == "null" ]; then
-    echo "$(date): 获取最新版本失败" >> $LOG_FILE
-    exit 1
-fi
-
-echo "$(date): 当前版本: $CURRENT_VERSION, 最新版本: $LATEST_VERSION" >> $LOG_FILE
-
-if [ "$CURRENT_VERSION" != "$LATEST_VERSION" ]; then
-    echo "$(date): 检测到新版本，开始升级..." >> $LOG_FILE
-    
-    # 停止服务
-    systemctl stop xmrminer
-    
-    # 备份配置
-    cp $INSTALL_DIR/config.json /tmp/xmrminer-config.json.bak
-    
-    # 下载新版本
-    cd /tmp
-    DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${LATEST_VERSION}/xmrminer-${LATEST_VERSION}-linux-x64.tar.gz"
-    wget -O xmrminer-new.tar.gz $DOWNLOAD_URL
-    
-    # 删除旧版本
-    rm -rf $INSTALL_DIR/*
-    
-    # 解压新版本
-    tar -xzf xmrminer-new.tar.gz -C $INSTALL_DIR
-    rm xmrminer-new.tar.gz
-    
-    # 恢复配置
-    cp /tmp/xmrminer-config.json.bak $INSTALL_DIR/config.json
-    
-    # 赋予执行权限
-    chmod +x $INSTALL_DIR/xmrminer
-    
-    # 保存版本信息
-    echo $LATEST_VERSION > $CURRENT_VERSION_FILE
-    
-    # 重启服务
-    systemctl start xmrminer
-    
-    echo "$(date): 升级完成，版本: $LATEST_VERSION" >> $LOG_FILE
-else
-    echo "$(date): 已是最新版本" >> $LOG_FILE
-fi
-UPGRADE_SCRIPT
-
-chmod +x /usr/local/bin/xmrminer-upgrade.sh
-
-# 保存当前版本信息
-echo $VERSION > $INSTALL_DIR/version.txt
-
-# 创建定时任务（每天凌晨3点检查更新）
-echo "[6/6] 设置自动升级定时任务..."
-cat > /etc/cron.d/xmrminer-upgrade <<EOF
-# 每天凌晨3点检查并升级XMRMiner
-0 3 * * * root /usr/local/bin/xmrminer-upgrade.sh
-EOF
-
-# 启用并启动服务
-echo "=== 启动XMRMiner服务 ==="
+# 启动服务
+echo "启用并启动 apoolminer 服务..."
+systemctl daemon-reexec
 systemctl daemon-reload
-systemctl enable xmrminer
-systemctl start xmrminer
-
-# 显示状态
-echo ""
-echo "=== 部署完成 ==="
-echo "程序版本: ${VERSION}"
-echo "挖矿钱包: $WALLET_ADDRESS"
-echo "矿池地址: $POOL_URL"
-echo ""
-echo "服务状态:"
-systemctl status xmrminer --no-pager
-echo ""
-echo "查看实时日志: journalctl -u xmrminer -f"
-echo "查看升级日志: tail -f /var/log/xmrminer-upgrade.log"
-echo "手动升级: /usr/local/bin/xmrminer-upgrade.sh"
-echo ""
+systemctl enable apoolminer
+systemctl restart apoolminer
+echo "========== 安装完成，服务已启动 =========="
